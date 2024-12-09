@@ -1,0 +1,313 @@
+---
+title: "Models"
+author: "Minu Pabbathi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(skimr) # skim()
+library(corrr)
+library(corrplot)
+library(naniar) # vis_miss()
+library(ROSE) #oversampling
+library(discrim) #LDA
+library(kernlab) # SVM kernels
+tidymodels_prefer()
+earthquakes <- read_csv("./data/earthquakes.csv")
+earthquakes <- earthquakes %>% 
+  mutate(alert = as.factor(alert), tsunami = as.factor(tsunami))
+```
+
+# Pre-processing
+
+```{r}
+earthquakes <- unique(earthquakes)
+earthquakes <- select(earthquakes, -"postcode", -"url", -"detailUrl", -"what3words", -"locationDetails", -"type", -"ids", -"id", -"code", -"geometryType", -"place", -"title", -"placeOnly", -"timezone", -"sources", -"date", -"time", -"updated", -"status", -"magType", -"net", -"types", -"locality", -"city", -"country", -"subnational", -"continent", -"location")
+```
+
+# Splitting
+
+```{r}
+set.seed(42)
+earthquakes_split <- initial_split(earthquakes, strata = tsunami)
+earthquakes_train <- training(earthquakes_split)
+earthquakes_test <- testing(earthquakes_split)
+earthquakes_folds <- vfold_cv(earthquakes_train, v = 5, strata = tsunami)
+```
+
+# Recipe
+
+```{r}
+earthquakes_recipe <- recipe(tsunami ~ ., data = earthquakes_train) %>% 
+  step_impute_mode(alert) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+```
+
+## Model Building
+
+**explain models and the process of building the model**
+
+### Logistic Model
+
+```{r}
+log_spec <- logistic_reg() %>% 
+  set_mode("classification") %>% 
+  set_engine("glm")
+
+log_wf <- workflow() %>% 
+  add_model(log_spec) %>% 
+  add_recipe(earthquakes_recipe)
+
+log_fit <- fit(log_wf, data = earthquakes_train)
+```
+
+ROC and AUC
+
+```{r}
+log_preds <- augment(log_fit, earthquakes_train)
+log_preds %>%
+  roc_curve(tsunami, .pred_1, event_level = "second") %>%
+  autoplot()
+```
+
+```{r}
+roc_auc(log_preds, truth = tsunami, .pred_1, event_level = "second")$.estimate
+```
+
+### LDA
+
+```{r}
+lda_spec <- discrim_linear() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+lda_wf <- workflow() %>% 
+  add_model(lda_spec) %>% 
+  add_recipe(earthquakes_recipe)
+
+lda_fit <- fit(lda_wf, data = earthquakes_train)
+```
+
+ROC and AUC
+
+```{r}
+lda_preds <- augment(lda_fit, earthquakes_train)
+lda_preds %>% 
+  roc_curve(truth = tsunami, .pred_1, event_level = "second") %>% 
+  autoplot()
+```
+
+```{r}
+roc_auc(lda_preds, tsunami, .pred_1, event_level = "second")$.estimate
+```
+
+### KNN
+
+```{r}
+knn_spec <- nearest_neighbor(neighbors = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn")
+
+knn_wf <- workflow() %>% 
+  add_model(knn_spec) %>% 
+  add_recipe(earthquakes_recipe)
+
+knn_grid <- grid_regular(neighbors(range = c(1, 10)),
+                         levels = 10)
+tune_knn <- tune_grid(knn_wf,
+                      resamples = earthquakes_folds,
+                      grid = knn_grid,
+                      metrics = metric_set(roc_auc))
+autoplot(tune_knn)
+
+best_knn <- select_best(tune_knn, metric = "roc_auc")
+knn_final_wf <- finalize_workflow(knn_wf, best_knn)
+knn_final_fit <- fit(knn_final_wf, data = earthquakes_train)
+```
+
+ROC and AUC
+
+this looks like a really good AUC but is slightly misleading since KNN is very prone to overfitting
+
+```{r}
+knn_preds <- augment(knn_final_fit, earthquakes_train)
+knn_preds %>% 
+  roc_curve(tsunami, .pred_1, event_level = "second") %>% 
+  autoplot()
+roc_auc(knn_preds, tsunami, .pred_1, event_level = "second")$.estimate
+```
+
+### Random Forest
+
+```{r}
+rf_spec <- rand_forest(mtry = tune(),
+                       trees = tune(),
+                       min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+rf_wf <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_recipe(earthquakes_recipe)
+
+rf_grid <- grid_regular(mtry(range = c(1, 14)),
+                        trees(range = c(100, 500)),
+                        min_n(range = c(10, 20)),
+                        levels = 14)
+```
+
+```{r, eval = F}
+tune_rf <- tune_grid(rf_wf,
+                     resamples = earthquakes_folds,
+                     grid = rf_grid,
+                     metrics = metric_set(roc_auc))
+save(tune_rf, file = "tune_rf.rda")
+```
+
+Since this model takes a while to run, we can save it after running and load the results.
+
+```{r}
+load("tune_rf.rda")
+autoplot(tune_rf)
+```
+
+```{r}
+best_rf <- select_best(tune_rf, metric = "roc_auc")
+rf_final_wf <- finalize_workflow(rf_wf, best_rf)
+rf_final_fit <- fit(rf_final_wf, earthquakes_train)
+
+rf_preds <- augment(rf_final_fit, earthquakes_train)
+
+roc_curve(rf_preds, truth = tsunami, .pred_1, event_level = "second") %>% 
+  autoplot()
+
+conf_mat(rf_preds, truth = tsunami, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+roc_auc(rf_preds, truth = tsunami, .pred_1, event_level = "second")$.estimate
+```
+
+### Boosted Tree
+
+```{r}
+bt_spec <- boost_tree(trees = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+bt_wf <- workflow() %>% 
+  add_model(bt_spec) %>% 
+  add_recipe(earthquakes_recipe)
+
+bt_grid <- grid_regular(trees(range = c(10, 2000)),
+                        levels = 10)
+
+tune_bt <- tune_grid(bt_wf,
+                     resamples = earthquakes_folds,
+                     grid = bt_grid,
+                     metrics = metric_set(roc_auc))
+
+autoplot(tune_bt)
+
+best_bt <- select_best(tune_bt, metric = "roc_auc")
+bt_final_wf <- finalize_workflow(bt_wf, best_bt)
+bt_final_fit <- fit(bt_final_wf, earthquakes_train)
+```
+
+ROC and AUC
+
+```{r}
+bt_preds <- augment(bt_final_fit, earthquakes_train)
+roc_curve(bt_preds, tsunami, .pred_1, event_level = "second") %>% 
+  autoplot()
+roc_auc(bt_preds, tsunami, .pred_1, event_level = "second")$.estimate
+
+conf_mat(bt_preds, truth = tsunami, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+### SVM Radial
+
+```{r}
+svm_rbf_spec <- svm_rbf(cost = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+
+svm_rbf_wf <- workflow() %>% 
+  add_recipe(earthquakes_recipe) %>% 
+  add_model(svm_rbf_spec)
+
+svm_rbf_grid <- grid_regular(cost(), levels = 5)
+
+tune_svm_rbf <- tune_grid(svm_rbf_wf,
+                          resamples = earthquakes_folds,
+                          grid = svm_rbf_grid,
+                          metrics = metric_set(roc_auc))
+
+ autoplot(tune_svm_rbf)
+
+best_svm_rbf <- select_best(tune_svm_rbf, metric = "roc_auc")
+
+svm_rbf_final_wf <- finalize_workflow(svm_rbf_wf, best_svm_rbf)
+svm_rbf_final_fit <- fit(svm_rbf_final_wf, earthquakes_train)
+```
+
+ROC and AUC
+
+```{r}
+svm_rbf_preds <- augment(svm_rbf_final_fit, earthquakes_train)
+roc_curve(svm_rbf_preds, tsunami, .pred_1, event_level = "second") %>% 
+  autoplot()
+roc_auc(svm_rbf_preds, tsunami, .pred_1, event_level = "second")$.estimate
+
+conf_mat(svm_rbf_preds, truth = tsunami, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+### SVM Linear
+
+```{r}
+svm_lin_spec <- svm_poly(degree = 1, cost = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+
+svm_lin_wf <- workflow() %>% 
+  add_recipe(earthquakes_recipe) %>% 
+  add_model(svm_lin_spec)
+
+svm_lin_grid <- grid_regular(cost(), levels = 5)
+
+tune_svm_lin <- tune_grid(svm_lin_wf,
+                          resamples = earthquakes_folds,
+                          grid = svm_lin_grid,
+                          metrics = metric_set(roc_auc))
+
+ autoplot(tune_svm_lin)
+
+best_svm_lin <- select_best(tune_svm_lin, metric = "roc_auc")
+
+svm_lin_final_wf <- finalize_workflow(svm_lin_wf, best_svm_lin)
+svm_lin_final_fit <- fit(svm_lin_final_wf, earthquakes_train)
+```
+
+ROC and AUC
+
+```{r}
+svm_lin_preds <- augment(svm_lin_final_fit, earthquakes_train)
+roc_curve(svm_lin_preds, tsunami, .pred_1, event_level = "second") %>% 
+  autoplot()
+roc_auc(svm_lin_preds, tsunami, .pred_1, event_level = "second")$.estimate
+
+conf_mat(svm_lin_preds, truth = tsunami, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
